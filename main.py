@@ -1,59 +1,87 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import MarianMTModel, MarianTokenizer, AutoModelForCausalLM, AutoTokenizer
 import torch
 
 app = FastAPI()
 
-# ---------- Language Maps ----------
-NLLB_CODES = {
-    "en": "eng_Latn",
-    "yo": "yor_Latn",
-    "ig": "ibo_Latn",
-    "ha": "hau_Latn",
-}
+# --------------------------
+# Load translation models
+# --------------------------
+def load_translator(src, tgt):
+    model_name = f"Helsinki-NLP/opus-mt-{src}-{tgt}"
+    tokenizer = MarianTokenizer.from_pretrained(model_name)
+    model = MarianMTModel.from_pretrained(model_name)
+    return model, tokenizer
 
-# ---------- Load models once ----------
-chatbot = pipeline("text2text-generation", model="google/flan-t5-small")
+# Yoruba
+yo_en_model, yo_en_tokenizer = load_translator("yo", "en")
+en_yo_model, en_yo_tokenizer = load_translator("en", "yo")
 
-translator_model = AutoModelForSeq2SeqLM.from_pretrained("facebook/nllb-200-distilled-600M")
-translator_tokenizer = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M")
+# Igbo
+ig_en_model, ig_en_tokenizer = load_translator("ig", "en")
+en_ig_model, en_ig_tokenizer = load_translator("en", "ig")
 
-# ---------- Utils ----------
-def translate(text: str, src: str, tgt: str) -> str:
-    translator_tokenizer.src_lang = src
-    inputs = translator_tokenizer(text, return_tensors="pt")
-    with torch.no_grad():
-        outputs = translator_model.generate(
-            **inputs,
-            forced_bos_token_id=translator_tokenizer.convert_tokens_to_ids(tgt),
-            max_new_tokens=128
-        )
-    return translator_tokenizer.decode(outputs[0], skip_special_tokens=True)
+# Hausa
+ha_en_model, ha_en_tokenizer = load_translator("ha", "en")
+en_ha_model, en_ha_tokenizer = load_translator("en", "ha")
 
-# ---------- Request Schema ----------
-class Message(BaseModel):
+# --------------------------
+# Load chatbot (English only)
+# --------------------------
+chat_tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-small")
+chat_model = AutoModelForCausalLM.from_pretrained("microsoft/DialoGPT-small")
+
+# --------------------------
+# Request schema
+# --------------------------
+class ChatRequest(BaseModel):
     text: str
-    lang: str  # "en", "yo", "ig", "ha"
+    lang: str  # "yo", "ig", "ha", or "en"
 
-# ---------- Routes ----------
+# --------------------------
+# Helper functions
+# --------------------------
+def translate(text, model, tokenizer):
+    inputs = tokenizer(text, return_tensors="pt", padding=True)
+    translated = model.generate(**inputs, max_length=200)
+    return tokenizer.decode(translated[0], skip_special_tokens=True)
+
+def chat_response(text):
+    inputs = chat_tokenizer.encode(text + chat_tokenizer.eos_token, return_tensors="pt")
+    outputs = chat_model.generate(inputs, max_length=200, pad_token_id=chat_tokenizer.eos_token_id)
+    return chat_tokenizer.decode(outputs[:, inputs.shape[-1]:][0], skip_special_tokens=True)
+
+# --------------------------
+# API endpoint
+# --------------------------
 @app.post("/chat")
-def chat(msg: Message):
-    src_code = NLLB_CODES.get(msg.lang, "eng_Latn")
+def chat(req: ChatRequest):
+    try:
+        user_text, lang = req.text, req.lang.lower()
 
-    # translate to English if needed
-    if src_code != "eng_Latn":
-        english_text = translate(msg.text, src_code, "eng_Latn")
-    else:
-        english_text = msg.text
+        # Step 1: Translate to English if needed
+        if lang == "yo":
+            user_text = translate(user_text, yo_en_model, yo_en_tokenizer)
+        elif lang == "ig":
+            user_text = translate(user_text, ig_en_model, ig_en_tokenizer)
+        elif lang == "ha":
+            user_text = translate(user_text, ha_en_model, ha_en_tokenizer)
 
-    # generate reply
-    reply_en = chatbot(english_text, max_length=100, do_sample=True)[0]["generated_text"]
+        # Step 2: Get chatbot response in English
+        reply_en = chat_response(user_text)
 
-    # translate back
-    if src_code != "eng_Latn":
-        reply_final = translate(reply_en, "eng_Latn", src_code)
-    else:
-        reply_final = reply_en
+        # Step 3: Translate back to user language
+        if lang == "yo":
+            reply = translate(reply_en, en_yo_model, en_yo_tokenizer)
+        elif lang == "ig":
+            reply = translate(reply_en, en_ig_model, en_ig_tokenizer)
+        elif lang == "ha":
+            reply = translate(reply_en, en_ha_model, en_ha_tokenizer)
+        else:
+            reply = reply_en
 
-    return {"reply": reply_final}
+        return {"reply": reply}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
